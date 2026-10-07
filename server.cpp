@@ -103,15 +103,15 @@ public:
     {
         // copies every frame, top to bottom in the array given as a parameter
         // this is what buildSnapshot() call, returns count written
-        int32_t written = 0;
+        int32_t done = 0;
         Node* current = top;
-        while (current != NULL && written < maxLen)
+        while (current != NULL && done < maxLen)
         {
-            out[written] = current->data;
-            written++;
+            out[done] = current->data;
+            done++;
             current = current->next;
         }
-        return written;
+        return done;
     }
 };
 
@@ -206,8 +206,10 @@ struct TTDBHeader
 };
 void writeHeader(FILE *f, const TTDBHeader &h)
 {
-    fwrite(h.magic, 1, 4, f);
-    fwrite(&h.version, sizeof(int32_t), 1, f);
+    fwrite(h.magic, sizeof(char), 4, f);
+    fwrite(&h.version, sizeof(int32_t) , 1, f);
+    fwrite(&h.stepCount, sizeof(int32_t), 1, f);
+    fwrite(&h.indexOffset, sizeof(int64_t), 1, f);
 
     // placeholder for other two data members
 }
@@ -227,22 +229,143 @@ struct PendingPatch
 
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
-bool readSourceLine(ifstream &in, string &out)
+bool noneed(char c)                                //helper
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+bool readSourceLine(ifstream& in, string& out)
 {
     // reads the next nonblank line
+    string line;
+	while (getline(in, line))                   //checks for empty lines and comments, and ignores leading / trailing space
+    {
+        int32_t start = 0;
+        int32_t end = (int32_t)line.size();
+        while (start < end && noneed(line[start]))
+        {
+            start++;
+        }
+        while (end > start && noneed(line[end - 1]))
+        {
+            end--;
+        }
+
+        if (start == end)
+        {
+            continue; 
+        }
+        if (end - start >= 2 && line[start] == '/' && line[start + 1] == '/')
+        {
+            continue; 
+        }
+
+        out = line.substr(start, end - start);
+        return true;
+    }
+    return false; // no more lines
 }
-string firstWord(const string &line)
-{
-    // returns first word from the input string
+string firstWord(const string& line)
+{  // returns first word from the input string
+    
+    int32_t i = 0;
+    int32_t n = (int32_t)line.size();
+    while (i < n && noneed(line[i]))   i++;
+  
+    int32_t start = i;
+    while (i < n && !noneed(line[i]))  i++;
+    
+    return line.substr(start, i - start);
 }
-string secondWord(const string &line)
+string secondWord(const string& line)
 {
     // returns the second word
+    int32_t i = 0;
+    int32_t n = (int32_t)line.size();
+    
+    while (i < n && noneed(line[i]))    i++;
+    
+    while (i < n && !noneed(line[i]))
+    {
+        i++;
+    }
+    // skip spaces, then read the second word
+    while (i < n && noneed(line[i]))   i++;
+    int32_t start = i;
+    while (i < n && !noneed(line[i]))  i++;
+
+
+    return line.substr(start, i - start);
 }
-bool validateProgram(const char *sourcePath)
+bool isKeyword(const string& word)
 {
-    // for each func defined there should be exactly one func_end and no nested funcs allowed - 
+    return word == "func" || word == "func_end" || word == "call" || word == "set" || word == "add" || word == "sub" || word == "mul" || word == "div";
 }
+
+
+
+
+bool validateProgram(const char* sourcePath)
+{
+    // for each func defined there should be exactly one func_end and no nested funcs allowed -
+    ifstream in(sourcePath);
+    if (!in)
+    {
+        setError("cannot open source file");
+        return false;
+    }
+
+    bool insideFunc = false; 
+    string currentFunc;
+    string line;
+
+    while (readSourceLine(in, line))
+    {
+        string word = firstWord(line);
+
+        if (!isKeyword(word))
+        {
+            setError("unknown instruction: " + line);
+            return false;
+        }
+
+        if (word == "func")
+        {
+            string name = secondWord(line);
+            if (name == "")
+            {
+                setError("func has no name");
+                return false;
+            }
+            if (insideFunc)
+            {
+                setError("function " + name + " is written inside function " + currentFunc);
+                return false;
+            }
+            insideFunc = true;
+            currentFunc = name;
+        }
+        else if (word == "func_end")
+        {
+            if (!insideFunc)
+            {
+                setError("func_end without a func");
+                return false;
+            }
+            insideFunc = false;
+        }
+    }
+
+    if (insideFunc)
+    {
+        setError("function " + currentFunc + " has no func_end");
+        return false;
+    }
+    return true;
+}
+
+
+
 
 // PASS 0x1: RESOLVE() -> resolve.bin
 int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
@@ -264,7 +387,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     // resolve() only PEEKS at the leading word(s) -- enough to spot FUNC
     // (remember its position) and CALL (remember which function it needs
     // and where its offset field sits).
-    // Once the whole file is written, every CALL's offset field is patched
+    // Once the whole file is done, every CALL's offset field is patched
     // with its target's position. Patching happens after the full write
     // Returns the byte offset of main's FUNC header record.
     // if there is no main return the error 
