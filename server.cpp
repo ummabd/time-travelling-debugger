@@ -120,29 +120,60 @@ public:
 struct Snapshot; // fwd declaration;
 struct TimelineNode
 {
-    Snapshot *data;
-    TimelineNode *next;
-    TimelineNode *prev;
+    Snapshot* data;
+    TimelineNode* next;
+    TimelineNode* prev;
 };
 class Timeline
 {
-    TimelineNode *head, *tail;
+    TimelineNode* head;
+    TimelineNode* tail;
     int32_t stepCount;
 
 public:
     // Implement these functions
     Timeline()
     {
+        head = NULL;
+        tail = NULL;
+        stepCount = 0;
     }
-    void record(Snapshot *s)
+    ~Timeline()
     {
-        // add record in the timeline
+        TimelineNode* temp = head;
+        while (temp != NULL)
+        {
+            TimelineNode* nyanode = temp->next;
+            delete temp->data;
+            delete temp;
+            temp = nyanode;
+        }
     }
-    TimelineNode *begin()
+    void record(Snapshot* s)
     {
+        // add record in the timeline (always at the end)
+        TimelineNode* nyanode = new TimelineNode;
+        nyanode->data = s;
+        nyanode->next = NULL;
+        nyanode->prev = tail;
+        if (tail == NULL)
+        {
+            head = nyanode; // first node
+        }
+        else
+        {
+            tail->next = nyanode;
+        }
+        tail = nyanode;
+        stepCount++;
+    }
+    TimelineNode* begin()
+    {
+        return head;
     }
     int32_t getStepCount()
     {
+        return stepCount;
     }
 };
 
