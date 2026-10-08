@@ -368,16 +368,39 @@ bool validateProgram(const char* sourcePath)
 
 
 // PASS 0x1: RESOLVE() -> resolve.bin
-int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
+int64_t writeResolveRecord(FILE* f, int64_t offsetField, const string& text)
 {
     // writes one [offset(8B)][size(4B)][string] record at the current file position
     // returns this record's own starting byte position
+    int64_t startPosition = ftell(f);
+    int32_t size = (int32_t)text.size();
+    fwrite(&offsetField, sizeof(int64_t), 1, f);
+    fwrite(&size, sizeof(int32_t), 1, f);
+    fwrite(text.c_str(), 1, size, f);
+    return startPosition;
 }
-int64_t readResolveRecord(FILE *f, string &outText)
+int64_t readResolveRecord(FILE* f, string& outText)
 {
     // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
+    // returns -1 if there is no record left (end of file)
+    int64_t offsetField;
+    int32_t size;
+    if (fread(&offsetField, sizeof(int64_t), 1, f) != 1)
+    {
+        return -1;
+    }
+    if (fread(&size, sizeof(int32_t), 1, f) != 1)
+    {
+        return -1;
+    }
+    char* buffer = new char[size + 1];
+    fread(buffer, 1, size, f);
+    buffer[size] = '\0';
+    outText = buffer;
+    delete[] buffer;
+    return offsetField;
 }
-int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
+int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath)
 {
     FuncEntry funcArray[MAX_FUNCS];
     int32_t funcCount = 0;
@@ -387,11 +410,125 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     // resolve() only PEEKS at the leading word(s) -- enough to spot FUNC
     // (remember its position) and CALL (remember which function it needs
     // and where its offset field sits).
-    // Once the whole file is done, every CALL's offset field is patched
+    // Once the whole file is written, every CALL's offset field is patched
     // with its target's position. Patching happens after the full write
     // Returns the byte offset of main's FUNC header record.
-    // if there is no main return the error 
+    // if there is no main return the error
+    // A call line stores -1 first, and then position of the function.
+
+    ifstream in(sourcePath);
+    if (!in)
+    {
+        setError("cannot open source file");
+        return -1;
+    }
+    FILE* out;
+    fopen_s(&out, resolveBinPath, "w+b");
+    if (out == NULL)
+    {
+        setError("cannot create resolve.bin");
+        return -1;
+    }
+
+    // ---- step 1: write every line as a record ----
+    string line;
+    while (readSourceLine(in, line))
+    {
+        string word = firstWord(line);
+        int64_t position = ftell(out);
+
+        if (word == "func")
+        {
+            string name = secondWord(line);
+            for (int32_t i = 0; i < funcCount; i++)
+            {
+                if (funcArray[i].funcName == name)  //duplicate function check
+                {
+                    setError("function " + name + " is defined twice");
+                    fclose(out);
+                    return -1;
+                }
+            }
+            if (funcCount >= MAX_FUNCS)
+            {
+                setError("too many functions");
+                fclose(out);
+                return -1;
+            }
+
+            funcArray[funcCount].funcName = name;
+            funcArray[funcCount].byteOffsetInResolveBin = position;
+            funcCount++;
+            writeResolveRecord(out, position, line);
+        }
+        else if (word == "call")
+        {
+            string target = secondWord(line);
+            if (target == "")
+            {
+                setError("call has no function name");
+                fclose(out);
+                return -1;
+            }
+            if (patchCount >= MAX_PATCHES)
+            {
+                setError("too many call lines");
+                fclose(out);
+                return -1;
+            }
+
+            patches[patchCount].byteOffsetOfOffsetField = position;
+            patches[patchCount].targetFuncName = target;
+            patchCount++;
+            writeResolveRecord(out, -1, line); 
+        }
+        else
+        {
+            writeResolveRecord(out, position, line);
+        }
+    }
+
+    for (int32_t p = 0; p < patchCount; p++){
+        int64_t targetOffset = -1;
+        for (int32_t i = 0; i < funcCount; i++){
+            if (funcArray[i].funcName == patches[p].targetFuncName){
+                targetOffset = funcArray[i].byteOffsetInResolveBin;
+            }
+        }
+    
+        if (targetOffset == -1){
+            setError("call to undefined function " + patches[p].targetFuncName);
+            fclose(out);
+            return -1;
+        }
+
+        fseek(out, (int64_t)patches[p].byteOffsetOfOffsetField, SEEK_SET);
+        fwrite(&targetOffset, sizeof(int64_t), 1, out);
+    
+    }
+    fclose(out);
+
+    for (int32_t i = 0; i < funcCount; i++){
+        if (funcArray[i].funcName == "main"){
+            return funcArray[i].byteOffsetInResolveBin;
+        }
+    }
+    setError("No main function, nalle");
+    return -1;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // PASS 0x2: EXECUTION (tokenization happens here)
 enum TokenType
