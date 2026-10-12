@@ -430,7 +430,6 @@ int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath)
         return -1;
     }
 
-    // ---- step 1: write every line as a record ----
     string line;
     while (readSourceLine(in, line))
     {
@@ -542,18 +541,274 @@ struct Token
     TokenType type;
     string text;
 };
-int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
+int32_t tokenizeLine(const string& line, Token tokens[], int32_t maxTokens)
 {
     // first word is always a instruction keyword
     // instruction set = [func, func_end, call, set, add, sub, mul and div]
     // next word is identifier like name of a function, variable name
     // after identifier all are the params/arg, space separated
+    // returns how many tokens were found, or -1 if the line has too many words
+    int32_t count = 0;
+    int32_t i = 0;
+    int32_t n = (int32_t)line.size();
+
+    while (i < n)
+    {
+        // skip spaces
+        while (i < n && isSpace(line[i]))
+        {
+            i++;
+        }
+        if (i >= n)
+        {
+            break;
+        }
+        // read one word
+        int32_t start = i;
+        while (i < n && !isSpace(line[i]))
+        {
+            i++;
+        }
+
+        if (count >= maxTokens)
+        {
+            return -1;
+        }
+        if (count == 0)
+        {
+            tokens[count].type = KEYWORD;
+        }
+        else if (count == 1)
+        {
+            tokens[count].type = IDENTIFIER;
+        }
+        else
+        {
+            tokens[count].type = PARAM;
+        }
+        tokens[count].text = line.substr(start, i - start);
+        count++;
+    }
+    return count;
 }
-Snapshot *buildSnapshot(Stack<Frame> &callStack)
+Snapshot* buildSnapshot(Stack<Frame>& callStack)
 {
     // build the snapshot based on the callStack given
+    // (callStack[0] in the snapshot is the top of the live stack)
+    Snapshot* s = new Snapshot;
+    s->stackDepth = callStack.snapshot_into(s->callStack, MAX_STACK_DEPTH);
+    return s;
 }
-void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
+
+
+bool isNumber(const string& word)       //integers greater than 9
+{
+    int32_t start = 0;
+    if (word.size() > 0 && word[0] == '-')
+    {
+        start = 1;
+    }
+    if (start >= (int32_t)word.size())
+    {
+        return false;
+    }
+    for (int32_t i = start; i < (int32_t)word.size(); i++)
+    {
+        if (word[i] < '0' || word[i] > '9')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+Variable* findVariable(Frame& frame, const string& name)
+{
+    for (int32_t i = 0; i < frame.argc; i++)
+    {
+        if (frame.argv[i].name == name)
+        {
+            return &frame.argv[i];
+        }
+    }
+    for (int32_t i = 0; i < frame.localCount; i++)
+    {
+        if (frame.locals[i].name == name)
+        {
+            return &frame.locals[i];
+        }
+    }
+    return NULL;
+}
+
+bool getValue(Frame& frame, const string& word, int32_t& result)
+{
+    if (isNumber(word))
+    {
+        result = atoi(word.c_str());
+        return true;
+    }
+    Variable* v = findVariable(frame, word);
+    if (v == NULL)
+    {
+        return false;
+    }
+    result = v->value;
+    return true;
+}
+
+bool doSetOrMath(Frame& current, Token tokens[], int32_t n, const string& line)
+{
+    string keyword = tokens[0].text;
+    string varName = tokens[1].text;
+
+    if (n < 3)
+    {
+        setError("missing value in: " + line);
+        return false;
+    }
+    int32_t number;
+    if (!getValue(current, tokens[2].text, number))
+    {
+        setError("unknown variable " + tokens[2].text + " in: " + line);
+        return false;
+    }
+    Variable* v = findVariable(current, varName);
+
+    if (keyword == "set")
+    {
+        if (v == NULL)
+        {
+            if (current.localCount >= MAX_VARS_PER_FRAME)
+            {
+                setError("too many variables in function " + current.func_name);
+                return false;
+            }
+            v = &current.locals[current.localCount];
+            v->name = varName;
+            current.localCount++;
+        }
+        v->value = number;
+        return true;
+    }
+
+    if (v == NULL)
+    {
+        setError("unknown variable " + varName + " in: " + line);
+        return false;
+    }
+    if (keyword == "add")
+    {
+        v->value = v->value + number;
+    }
+    else if (keyword == "sub")
+    {
+        v->value = v->value - number;
+    }
+    else if (keyword == "mul")
+    {
+        v->value = v->value * number;
+    }
+    else
+    {
+        if (number == 0)
+        {
+            setError("division by zero in: " + line);
+            return false;
+        }
+        v->value = v->value / number;
+    }
+    return true;
+}
+
+// handles: call   (makes a new frame for the function and pushes it)
+// callStart   = where this call line starts in resolve.bin
+// targetOffset = where the called function starts (patched in pass 0x1)
+bool doCall(FILE* f, Stack<Frame>& callStack, int64_t callPos[], Token tokens[], int32_t n,int64_t callStart, int64_t targetOffset)
+{
+    if (targetOffset == -1)                         //new frames where a frame starts where a call dunction starts
+    {
+        setError("call was not resolved");
+        return false;
+    }
+    if (callStack.depth() >= MAX_STACK_DEPTH)
+    {
+        setError("stack overflow: too many nested calls");
+        return false;
+    }
+
+    int32_t argCount = n - 2;
+    int64_t returnPosition = ftell(f);
+    Frame& caller = callStack.peek();
+
+    fseek(f, (long)targetOffset, SEEK_SET);
+    string headerLine;
+    readResolveRecord(f, headerLine);
+    Token header[MAX_TOKENS];
+    int32_t headerCount = tokenizeLine(headerLine, header, MAX_TOKENS);
+    if (headerCount < 2)
+    {
+        setError("bad function line: " + headerLine);
+        return false;
+    }
+    if (headerCount - 2 != argCount)
+    {
+        setError("wrong number of arguments for function " + header[1].text);
+        return false;
+    }
+
+    Frame callee;
+    callee.func_name = header[1].text;
+    callee.argc = argCount;
+    callee.returnLine = (int32_t)returnPosition;
+    callee.localCount = 0;
+    for (int32_t i = 0; i < argCount; i++)
+    {
+        int32_t value;
+        if (!getValue(caller, tokens[i + 2].text, value))
+        {
+            setError("unknown variable " + tokens[i + 2].text + " in call");
+            return false;
+        }
+        callee.argv[i].name = header[i + 2].text;
+        callee.argv[i].value = value;
+    }
+
+    callPos[callStack.depth()] = callStart;
+    callStack.push(callee);
+    return true;
+}
+
+void doReturn(FILE* f, Stack<Frame>& callStack, int64_t callPos[])          //return 
+{
+    int32_t depth = callStack.depth();
+    Frame callee = callStack.pop();
+    Frame& caller = callStack.peek();
+
+    fseek(f, (long)callPos[depth - 1], SEEK_SET);
+    string callLine;
+    readResolveRecord(f, callLine);
+    Token callTokens[MAX_TOKENS];
+    tokenizeLine(callLine, callTokens, MAX_TOKENS);
+
+    for (int32_t i = 0; i < callee.argc; i++)
+    {
+        string passed = callTokens[i + 2].text;
+        if (isNumber(passed))
+        {
+            continue;
+        }
+        Variable* v = findVariable(caller, passed);
+        if (v != NULL)
+        {
+            v->value = callee.argv[i].value;
+        }
+    }
+
+    fseek(f, (long)callee.returnLine, SEEK_SET);
+}
+
+void executeProgram(const char* resolveBinPath, int64_t mainOffset, Timeline& timeline)
 {
     // initialize the call stack
     // make the main frame
@@ -561,6 +816,110 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
     // implementation:
     // execute line by line, and according to the keyword perform action
+    //
+    // A snapshot is taken after every executed line (set, add, sub, mul, div, call, func_end).
+    // When main reaches its func_end the program is finished.
+    FILE* f;
+    fopen_s(&f, resolveBinPath, "rb");
+    if (f == NULL)
+    {
+        setError("cannot open resolve.bin");
+        return;
+    }
+
+    Stack<Frame> callStack;
+    int64_t callPos[MAX_STACK_DEPTH]; 
+    Token tokens[MAX_TOKENS];
+    string line;
+    fseek(f, (long)mainOffset, SEEK_SET);
+    readResolveRecord(f, line);
+    int32_t n = tokenizeLine(line, tokens, MAX_TOKENS);
+    if (n < 2)
+    {
+        setError("bad main line");
+        fclose(f);
+        return;
+    }
+    Frame mainFrame;
+    mainFrame.func_name = tokens[1].text;
+    mainFrame.argc = n - 2;
+    for (int32_t i = 0; i < mainFrame.argc; i++)
+    {
+        mainFrame.argv[i].name = tokens[i + 2].text;
+        mainFrame.argv[i].value = 0;
+    }
+    mainFrame.returnLine = -1;
+    mainFrame.localCount = 0;
+    callStack.push(mainFrame);
+    callPos[0] = -1;
+
+    int32_t steps = 0;
+    while (true)
+    {
+        int64_t lineStart = ftell(f);
+        int64_t offsetField = readResolveRecord(f, line);
+        if (offsetField == -1 && feof(f))
+        {
+            setError("program ended without func_end of main");
+            break;
+        }
+
+        n = tokenizeLine(line, tokens, MAX_TOKENS);
+        if (n < 1)
+        {
+            setError("bad line: " + line);
+            break;
+        }
+
+        string keyword = tokens[0].text;
+        bool ok = true;
+        bool finished = false;
+
+        if (keyword == "set" || keyword == "add" || keyword == "sub" || keyword == "mul" || keyword == "div")
+        {
+            ok = doSetOrMath(callStack.peek(), tokens, n, line);
+        }
+        else if (keyword == "call")
+        {
+            ok = doCall(f, callStack, callPos, tokens, n, lineStart, offsetField);
+        }
+        else if (keyword == "func_end")
+        {
+            if (callStack.depth() == 1)
+            {
+                finished = true; // main func_end
+            }
+            else
+            {
+                doReturn(f, callStack, callPos);
+            }
+        }
+        else
+        {
+            setError("cannot run this line: " + line);
+            ok = false;
+        }
+
+        if (!ok)
+        {
+            break;
+        }
+
+        timeline.record(buildSnapshot(callStack));  //snaps ni rukni chahiyai
+        steps++;
+
+        if (finished)
+        {
+            break;
+        }
+        if (steps >= MAX_STEPS)
+        {
+            setError("program runs for too many steps");
+            break;
+        }
+    }
+
+    fclose(f);
 }
 
 // PASS 0x3: SERIALIZE TIMELINE
