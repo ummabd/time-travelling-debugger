@@ -23,3 +23,11 @@ October 10
 01:52 AM
 0x2 bhi ho gya jee. 
 Hanan bhai allah ka vasta hai dubara aesa project na dena...................TTTTTTTTTTTTTTT_TTTTTTTTTTTTTTT
+
+
+
+
+
+October 16
+04:37 AM
+im done.
